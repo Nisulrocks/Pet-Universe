@@ -1,4 +1,4 @@
-local key = getgenv().HIDE_LAT_KEY or "hl_VIDp-cX0_xmJYVGOxQdQe-ivkwDK-oYoI"
+local key = getgenv().HIDE_LAT_KEY or ""
 local hwid = (gethwid and gethwid()) or "unknown"
 local url = "https://loadstri.ng/l/23beab8c-c0bc-4628-bc4c-2d0342bad2ef"
 local send = request or http_request or (syn and syn.request)
