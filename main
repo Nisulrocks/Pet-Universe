@@ -21,6 +21,10 @@ KeySystem.Config.DiscordLink = "https://discord.gg/jUctfTAa5D"
 
 KeySystem.Validate():andThen(function()
 
+-- Everything below runs inside one guarded call, so a failure at start-up reports
+-- where it happened (script line and call stack) instead of a bare error.
+local bootOk, bootErr = xpcall(function()
+
 -----------------------------------------------------------
 -- SERVICES
 -----------------------------------------------------------
@@ -1358,6 +1362,38 @@ Fn.runLoop("AutoClick", function() return State.autoClick end, Fn.clickStep,
 
 local alienRef = nil
 
+-- What we know about the egg while it may be in a world we are not standing in.
+-- Models of other worlds are not loaded here, so the scan cannot see an egg that
+-- landed elsewhere: the server's messages say when it is coming and (often) where.
+local Alien = {
+	pendingUntil = 0,   -- an egg is expected until this time
+	eventAt = -math.huge,
+	hint = nil,         -- the world the server named, when it named one
+	hintSince = nil,    -- when we arrived in that world
+	seenWorld = nil,    -- where we last saw the egg
+	miss = 0,           -- scans in a row that missed it where it was
+	searched = {},      -- worlds already looked in during this search
+	pausedUntil = 0,
+	log = "",           -- the last server message, for the status line
+	state = nil,        -- the last GetState answer
+}
+
+-- Search order when the server did not name a world.
+local ALIEN_WORLD_ORDER = {
+	"Spawn", "BirchForest", "TreasureDunes", "FrozenAlley", "HauntedHouse",
+	"PetKingdom", "EnchantedGrove", "VolcanoHollow", "TheMoon",
+}
+
+function Fn.alienPending()
+	return os.clock() < Alien.pendingUntil
+end
+
+-- The egg is alive while it is on screen, or while the server says one is coming.
+function Fn.alienGone()
+	if not State.destroyAlien then return true end
+	return not ((alienRef and alienRef.Parent) or Fn.alienPending())
+end
+
 -- Spawned egg may be renamed; the MaxHP attribute plus a ClickDetector is unique to it.
 function Fn.scanEgg()
 	local found = nil
@@ -1366,24 +1402,32 @@ function Fn.scanEgg()
 		if m and Fn.eggPart(m) then found = m break end
 	end
 
-	if not found then
-		local active = false
-		pcall(function()
-			local svc = Fn.GetSvc("AlienEventService")
-			local state = svc and svc.GetState and svc.GetState()
-			active = state ~= nil and state ~= "Idle"
-			alienEventState = state or "Idle"
-		end)
-		if active then
-			local breakables = Workspace:FindFirstChild("Breakables")
-			if breakables then
-				for _, d in ipairs(breakables:GetDescendants()) do
-					if d:IsA("ClickDetector") then
-						local m = d.Parent
-						if m and m:IsA("Model") and not SKIP_BREAKABLES[m.Name] and m:GetAttribute("MaxHP") ~= nil then
-							found = m
-							break
-						end
+	-- The server's own word on whether an egg event is running (raw call: the Knit
+	-- wrapper would shift the arguments).
+	local state
+	local ok, res = Fn.invoke("AlienEventService", "GetState")
+	if ok and type(res[1]) == "string" then state = res[1] end
+	if state then alienEventState = state end
+
+	-- A change out of Idle is an event starting. (A state that just stays non-Idle is
+	-- not taken as a live egg, or a long cooldown state would hold everything up.)
+	if state and state ~= Alien.state then
+		if state ~= "Idle" then
+			Alien.pendingUntil = math.max(Alien.pendingUntil, os.clock() + 240)
+			Alien.log = "state: " .. state
+		end
+		Alien.state = state
+	end
+
+	if not found and ((state ~= nil and state ~= "Idle") or Fn.alienPending()) then
+		local breakables = Workspace:FindFirstChild("Breakables")
+		if breakables then
+			for _, d in ipairs(breakables:GetDescendants()) do
+				if d:IsA("ClickDetector") then
+					local m = d.Parent
+					if m and m:IsA("Model") and not SKIP_BREAKABLES[m.Name] and m:GetAttribute("MaxHP") ~= nil then
+						found = m
+						break
 					end
 				end
 			end
@@ -1391,6 +1435,20 @@ function Fn.scanEgg()
 	end
 
 	alienRef = found
+
+	if found then
+		Alien.miss = 0
+		Alien.seenWorld = Fn.alienWorld(found) or Alien.seenWorld
+		if Alien.seenWorld then Alien.hint = Alien.seenWorld end
+		Alien.pendingUntil = math.max(Alien.pendingUntil, os.clock() + 30)
+	elseif Alien.seenWorld and Fn.currentWorld() == Fn.normWorld(Alien.seenWorld) then
+		-- Standing where it was and it is gone: destroyed, or taken by someone else.
+		Alien.miss = Alien.miss + 1
+		if Alien.miss >= 2 then
+			Alien.pendingUntil, Alien.seenWorld, Alien.hint, Alien.hintSince = 0, nil, nil, nil
+			table.clear(Alien.searched)
+		end
+	end
 
 	local text = "Alien Egg: not spawned"
 	if alienRef then
@@ -1401,6 +1459,9 @@ function Fn.scanEgg()
 		else
 			text = "Alien Egg: spawned"
 		end
+		if FeatureStatus.alien then text = text .. " | " .. FeatureStatus.alien end
+	elseif Fn.alienPending() then
+		text = "Alien Egg: incoming (" .. (Alien.hint and Fn.worldLabel(Alien.hint) or "world unknown") .. ")"
 		if FeatureStatus.alien then text = text .. " | " .. FeatureStatus.alien end
 	end
 	if EggLabel then pcall(function() EggLabel:Set(text) end) end
@@ -1421,16 +1482,101 @@ function Fn.alienWorld(egg)
 		return (cur.Name == "Haunted" and "HauntedHouse") or cur.Name
 	end
 
-	local zones = Fn.getModule("WorldZones")
 	local part = Fn.eggPart(egg)
-	if zones and type(zones.Bounds) == "table" and part then
-		local p = part.Position
+	return part and Fn.worldAtPosition(part.Position) or nil
+end
+
+-- The world whose bounds contain a point.
+function Fn.worldAtPosition(p)
+	local zones = Fn.getModule("WorldZones")
+	if zones and type(zones.Bounds) == "table" then
 		for name, b in pairs(zones.Bounds) do
-			if p.X >= b.minX and p.X <= b.maxX and p.Z >= b.minZ and p.Z <= b.maxZ then return name end
+			if p.X >= b.minX and p.X <= b.maxX and p.Z >= b.minZ and p.Z <= b.maxZ then return Fn.normWorld(name) end
 		end
 	end
 	return nil
 end
+
+-- A world named in some text ("Pet Kingdom", "HauntedHouse"...), as the zone name.
+function Fn.knownWorld(text)
+	local flat = string.lower((string.gsub(tostring(text), "[^%w]", "")))
+	if flat == "" then return nil end
+	if flat == "spawn" then return "Spawn" end -- "spawned" is everywhere in event text
+
+	local cost = Fn.getModule("WorldCost")
+	local display = cost and cost.DisplayNames
+	for _, key in ipairs(ALIEN_WORLD_ORDER) do
+		if key ~= "Spawn" then
+			local names = { key }
+			if type(display) == "table" and type(display[key]) == "string" then names[2] = display[key] end
+			for _, name in ipairs(names) do
+				local flatName = string.lower((string.gsub(name, "[^%w]", "")))
+				if flatName ~= "" and flat:find(flatName, 1, true) then return key end
+			end
+		end
+	end
+	if flat:find("haunted", 1, true) then return "HauntedHouse" end
+	return nil
+end
+
+-- Looks through a message's arguments for a world name or a landing position.
+function Fn.findWorldIn(value, depth)
+	if depth > 3 then return nil end
+	if type(value) == "string" then return Fn.knownWorld(value) end
+	if typeof(value) == "Vector3" then return Fn.worldAtPosition(value) end
+	if typeof(value) == "CFrame" then return Fn.worldAtPosition(value.Position) end
+	if type(value) == "table" then
+		for _, v in pairs(value) do
+			local world = Fn.findWorldIn(v, depth + 1)
+			if world then return world end
+		end
+	end
+	return nil
+end
+
+-- Any message from the egg event: an egg is expected, and the message may say where.
+function Fn.onAlienEvent(source, ...)
+	local args = table.pack(...)
+	local parts = {}
+	for i = 1, args.n do
+		local v = args[i]
+		parts[#parts + 1] = type(v) == "table" and Fn.describe(v) or tostring(v)
+	end
+	Alien.log = string.sub(source .. ": " .. table.concat(parts, ", "), 1, 160)
+	Alien.eventAt = os.clock()
+	Alien.pendingUntil = math.max(Alien.pendingUntil, os.clock() + 240)
+
+	local world
+	for i = 1, args.n do
+		world = Fn.findWorldIn(args[i], 0)
+		if world then break end
+	end
+	if world then Alien.hint, Alien.hintSince = world, nil end
+
+	-- A fresh announcement or landing starts the search over.
+	if source:find("Announce", 1, true) or source:find("Fall", 1, true) then
+		table.clear(Alien.searched)
+		Alien.pausedUntil = 0
+		task.spawn(pcall, Fn.scanEgg)
+	end
+end
+
+pcall(function()
+	local function listen(remote, source)
+		if remote and remote:IsA("RemoteEvent") then
+			remote.OnClientEvent:Connect(function(...) Fn.onAlienEvent(source, ...) end)
+		end
+	end
+
+	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+	local eggsFolder = remotes and remotes:FindFirstChild("Eggs")
+	for _, name in ipairs({ "AlienEggAnnounce", "AlienEggFall", "AlienEggUI" }) do
+		listen(eggsFolder and eggsFolder:FindFirstChild(name), name)
+	end
+	for _, name in ipairs({ "Announce", "Fall", "UI" }) do
+		listen(Fn.knitRemote("AlienEventService", "RE", name), "AlienEventService." .. name)
+	end
+end)
 
 local ALIEN_REACH = 95 -- click detectors reach 100 studs
 local alienClicks = 0   -- hits on the alien egg, for the end-of-event report
@@ -1438,20 +1584,7 @@ local alienClicks = 0   -- hits on the alien egg, for the end-of-event report
 local alienHome = nil          -- where we stood before the event pulled us away
 local alienApproached = false  -- the one allowed step-in per event
 local alienLastTravel = -math.huge
-
-function Fn.alienGone()
-	return not State.destroyAlien or not (alienRef and alienRef.Parent)
-end
-
--- The egg's own readouts. The server reports its progress on AlienEventService.UI,
--- and the model may carry health as attributes; either one shows a hit landed.
-local alienUi = { at = -math.huge }
-pcall(function()
-	local r = Fn.knitRemote("AlienEventService", "RE", "UI")
-	if r and r:IsA("RemoteEvent") then
-		r.OnClientEvent:Connect(function() alienUi.at = os.clock() end)
-	end
-end)
+local alienForcedFarm = false
 
 function Fn.eggHealth(egg)
 	local total, found = 0, false
@@ -1471,65 +1604,6 @@ function Fn.eggHealth(egg)
 	return found and total or nil
 end
 
-function Fn.eggAttributeNames(egg)
-	local names = {}
-	pcall(function()
-		for name, v in pairs(egg:GetAttributes()) do names[#names + 1] = name .. "=" .. tostring(v) end
-	end)
-	table.sort(names)
-	return table.concat(names, ", ")
-end
-
--- The call that attacks the egg: AlienEventService.RE.Hit. Its argument is not
--- documented, so the likely shapes are tried once, checked against the egg's
--- health (or the server's UI update), and the one that works is remembered.
-function Fn.alienHitForms(egg)
-	local id
-	for _, key in ipairs({ "Id", "ID", "UUID", "Uuid", "BreakableId", "EggId" }) do
-		local v = egg:GetAttribute(key)
-		if v ~= nil then id = v break end
-	end
-	local forms = {
-		function() Fn.fireRaw("AlienEventService", "Hit") end,
-		function() Fn.fireRaw("AlienEventService", "Hit", egg) end,
-		function() Fn.fireRaw("AlienEventService", "Hit", egg.Name) end,
-		function() Fn.fireRaw("AlienEventService", "Hit", 1) end,
-	}
-	if id ~= nil then forms[#forms + 1] = function() Fn.fireRaw("AlienEventService", "Hit", id) end end
-	return forms
-end
-
-function Fn.hitAlienRemote(egg)
-	local forms = Fn.alienHitForms(egg)
-	local known = ProbeCache["alienHit"]
-	if known and forms[known] then
-		pcall(forms[known])
-		return true
-	end
-
-	local before, mark = Fn.eggHealth(egg), alienUi.at
-	return Fn.tryForms("alienHit", forms, function()
-		local now = Fn.eggHealth(egg)
-		if before and now then return now < before end
-		return alienUi.at > mark
-	end, nil, 1.5, Fn.alienGone)
-end
-
--- A real tap on the egg's spot on screen, when it is in view.
-function Fn.tapOnScreen(part)
-	local camera = Workspace.CurrentCamera
-	local ok, vim = pcall(function() return game:GetService("VirtualInputManager") end)
-	if not (camera and ok and vim) then return end
-	local v, onScreen = camera:WorldToViewportPoint(part.Position)
-	if not onScreen then return end
-	pcall(function()
-		vim:SendMouseButtonEvent(v.X, v.Y, 0, true, game, 1)
-		vim:SendMouseButtonEvent(v.X, v.Y, 0, false, game, 1)
-	end)
-end
-
-local alienForcedFarm = false
-
 -- Back to where we were, the same way we left: world teleport, then hop. A new
 -- egg appearing on the way cancels the hop; the next tick picks the event up again.
 function Fn.returnFromAlien()
@@ -1538,11 +1612,65 @@ function Fn.returnFromAlien()
 	Fn.returnToPlace(home, function() return not Fn.alienGone() end)
 end
 
--- Highest priority task in the script. While a live egg exists everything else
--- holds (see OUTRANKED_BY). The egg is reached by taking the game's world
--- teleport to its world and clicking it from where we land.
+-- No egg in view: look for it in the world the server named, or in each world in turn.
+function Fn.searchWorlds()
+	if os.clock() < Alien.pausedUntil then return end
+
+	for _, world in ipairs(ALIEN_WORLD_ORDER) do
+		if Fn.alienGone() or (alienRef and alienRef.Parent) then return end
+		if not Alien.searched[world] and Fn.currentWorld() ~= world and Fn.isWorldOwned(world) ~= false then
+			Alien.searched[world] = true
+			Fn.setFeature("alien", "searching " .. Fn.worldLabel(world) .. " for the egg")
+
+			if Fn.travelToWorld(world, nil, Fn.alienGone) then
+				for _ = 1, 6 do -- let the world load in, checking as it does
+					task.wait(0.5)
+					pcall(Fn.scanEgg)
+					if Fn.alienGone() or (alienRef and alienRef.Parent) then return end
+				end
+			end
+		end
+	end
+
+	-- Nothing anywhere yet (it may still be falling): start over after a pause.
+	table.clear(Alien.searched)
+	Alien.pausedUntil = os.clock() + 15
+	Fn.setFeature("alien", "egg not found yet, looking again shortly (" .. (Alien.log ~= "" and Alien.log or "no server message") .. ")")
+end
+
+function Fn.findAlienEgg()
+	local hint = Alien.hint
+	if hint then
+		local world = Fn.normWorld(hint)
+		if Fn.currentWorld() ~= world then
+			if os.clock() - alienLastTravel > 10 then
+				alienLastTravel = os.clock()
+				Alien.hintSince = nil
+				Fn.setFeature("alien", "going to " .. Fn.worldLabel(world) .. " for the egg")
+				Fn.travelToWorld(world, nil, Fn.alienGone)
+				task.wait(1)
+				pcall(Fn.scanEgg)
+			end
+			return
+		end
+
+		-- In the named world: give the egg a while to show up before doubting the name.
+		Alien.hintSince = Alien.hintSince or os.clock()
+		if os.clock() - Alien.hintSince <= 20 then
+			Fn.setFeature("alien", "in " .. Fn.worldLabel(world) .. ", waiting for the egg")
+			pcall(Fn.scanEgg)
+			return
+		end
+		Alien.hint, Alien.hintSince = nil, nil
+	end
+
+	Fn.searchWorlds()
+end
+
+-- Highest priority task in the script. While an egg is up (or on its way) everything
+-- else holds (see OUTRANKED_BY). It goes to the egg's world with the game's world
+-- teleport, and attacks the egg the way breakables are attacked: a click.
 function Fn.alienStep()
-	local egg = alienRef
 	if Fn.alienGone() then
 		if alienHome then Fn.returnFromAlien() end
 		Fn.setClaim("alien", false)
@@ -1563,6 +1691,12 @@ function Fn.alienStep()
 	if State.craftBusy then return end
 
 	if not alienHome then alienHome = Fn.savePlace() end
+
+	local egg = alienRef
+	if not (egg and egg.Parent) then
+		Fn.findAlienEgg()
+		return
+	end
 
 	-- One world teleport per attempt window. If the zone never confirms (it can
 	-- lag), carry on and click rather than re-teleporting every tick.
@@ -1588,39 +1722,21 @@ function Fn.alienStep()
 		Fn.teleportTo(Fn.groundAt(part.Position + away * 60), 8, 20, Fn.alienGone)
 	end
 
-	-- Attack the egg itself: the click, the game's own hit call, and a screen tap.
-	if det and typeof(fireclickdetector) == "function" then fireclickdetector(det) end
-	local hitSent = Fn.hitAlienRemote(egg)
-	Fn.tapOnScreen(part)
+	if not det then Fn.setFeature("alien", "egg has no click detector") return end
+
+	-- The same click the breakables get.
+	if typeof(fireclickdetector) == "function" then fireclickdetector(det) end
 	Stats.clicks = Stats.clicks + 1
 	alienClicks = alienClicks + 1
 
 	local hp = Fn.eggHealth(egg)
-	if hp then
-		Fn.setFeature("alien", string.format("attacking the egg (health %d)", math.floor(hp)))
-	elseif not hitSent then
-		Fn.setFeature("alien", "attacking the egg; hit call not confirmed (" .. Fn.eggAttributeNames(egg) .. ")")
-	else
-		Fn.setFeature("alien", "attacking the egg")
-	end
+	Fn.setFeature("alien", hp and string.format("attacking the egg (health %d)", math.floor(hp)) or "attacking the egg")
 end
-
-pcall(function()
-	-- Instant wake-up on the server's spawn announcement (payload ignored).
-	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-	local eggsFolder = remotes and remotes:FindFirstChild("Eggs")
-	if eggsFolder then
-		for _, name in ipairs({ "AlienEggAnnounce", "AlienEggFall", "AlienEggUI" }) do
-			local r = eggsFolder:FindFirstChild(name)
-			if r then r.OnClientEvent:Connect(function() task.spawn(pcall, Fn.scanEgg) end) end
-		end
-	end
-end)
 
 task.spawn(function()
 	while Fn.alive() do
 		pcall(Fn.scanEgg)
-		task.wait(State.destroyAlien and 2 or 6)
+		task.wait((State.destroyAlien and 2) or 6)
 	end
 end)
 
@@ -4911,7 +5027,7 @@ function Fn.setLowGfx(on)
 				elseif v:IsA("Decal") then
 					v.Transparency = 1
 				elseif v:IsA("ParticleEmitter") or v:IsA("Trail") then
-					v.Lifetime = NumberRange.new(0)
+					v.Enabled = false
 				end
 				if i % 2000 == 0 then task.wait() end
 			end
@@ -4956,7 +5072,7 @@ Rayfield = result
 warn("[PU DEBUG] After Rayfield")
 env.NisulPURayfield = Rayfield
 
-local Window = Rayfield:CreateWindow({
+local windowOk, Window = pcall(Rayfield.CreateWindow, Rayfield, {
 	Name = "Pets Universe V1.0.2",
 	LoadingTitle = "PU Auto Farm V1.0.2",
 	LoadingSubtitle = "by NisulRocks | Made with love",
@@ -4967,6 +5083,11 @@ local Window = Rayfield:CreateWindow({
 	ConfigurationSaving = { Enabled = true, FolderName = "NisulRocks PU", FileName = "PU_AutoFarm_V1" },
 	KeySystem = false,
 })
+
+if not windowOk or not Window then
+	warn("[PU] Rayfield could not build the window (this executor may not support it): " .. tostring(Window))
+	return
+end
 
 -- Small builders so each tab reads as a list of options, not boilerplate.
 function Fn.addToggle(tab, label, name, flag, default, onChange, tooltip)
@@ -4980,21 +5101,44 @@ end
 
 function Fn.addSlider(tab, label, name, flag, range, increment, suffix, default, onChange)
 	return Fn.safeUI(label, function()
-		return tab:CreateSlider({
+		local element = tab:CreateSlider({
 			Name = name, Range = range, Increment = increment, Suffix = suffix,
 			CurrentValue = default, Flag = flag,
 			Callback = function(v) onChange(v) end,
 		})
+
+		-- Rayfield applies the saved config through element:Set. A value of the wrong
+		-- kind (a flag an older version used for another control) would error there.
+		if type(element) == "table" and type(element.Set) == "function" then
+			local set = element.Set
+			element.Set = function(self, value, ...)
+				value = tonumber(type(value) == "table" and value[1] or value)
+				if not value then return end
+				return set(self, value, ...)
+			end
+		end
+		return element
 	end)
 end
 
 function Fn.addDropdown(tab, label, name, flag, options, default, multi, onChange)
 	return Fn.safeUI(label, function()
-		return tab:CreateDropdown({
+		local element = tab:CreateDropdown({
 			Name = name, Options = options, CurrentOption = default,
 			MultipleOptions = multi, Flag = flag,
 			Callback = function(selected) onChange(selected) end,
 		})
+
+		-- Same guard as the slider: a saved number for a dropdown would make
+		-- Rayfield's Set index it and error. Turn it into the matching option text.
+		if type(element) == "table" and type(element.Set) == "function" then
+			local set = element.Set
+			element.Set = function(self, value, ...)
+				if type(value) ~= "table" and type(value) ~= "string" then value = { tostring(value) } end
+				return set(self, value, ...)
+			end
+		end
+		return element
 	end)
 end
 
@@ -5683,5 +5827,13 @@ if #UIErrors > 0 then
 end
 
 Fn.notify("System Ready", "Welcome to NisulRocks PU AutoFarm V1.0.2", 5)
+
+end, function(err)
+	return debug.traceback(tostring(err), 2)
+end)
+
+if not bootOk then
+	warn("[PU] failed to start: " .. tostring(bootErr))
+end
 
 end)
