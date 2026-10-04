@@ -4961,14 +4961,35 @@ end
 
 warn("[PU DEBUG] Before Rayfield")
 
-local ok, result = pcall(function()
-    return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
-end)
+local ok, result = false, nil
+
+-- sirius.menu is tried first, then the same library from GitHub in case that host is blocked.
+do
+    local urls = {
+        "https://sirius.menu/rayfield",
+        "https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/main/source.lua",
+    }
+    local errors = {}
+    for _, url in ipairs(urls) do
+        local good, value = pcall(function()
+            local chunk, compileError = loadstring(game:HttpGet(url))
+            if not chunk then error("loadstring: " .. tostring(compileError)) end
+            return chunk()
+        end)
+        if good and value then
+            ok, result = true, value
+            break
+        end
+        errors[#errors + 1] = url .. " -> " .. tostring(value)
+    end
+    if not ok then
+        warn("[PU] Rayfield failed to load: " .. table.concat(errors, " | "))
+    end
+end
 
 warn("[PU DEBUG] Rayfield result:", ok, result)
 
 if not ok or not result then
-    warn("[PU DEBUG] Rayfield failed")
     return
 end
 
