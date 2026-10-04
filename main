@@ -1373,6 +1373,8 @@ local Alien = {
 	seenWorld = nil,    -- where we last saw the egg
 	miss = 0,           -- scans in a row that missed it where it was
 	searched = {},      -- worlds already looked in during this search
+	landed = false,     -- the egg has actually arrived (landing message, or seen on screen)
+	travelled = {},     -- worlds already travelled to for this egg: one trip each, never a loop
 	pausedUntil = 0,
 	log = "",           -- the last server message, for the status line
 	state = nil,        -- the last GetState answer
@@ -1437,6 +1439,7 @@ function Fn.scanEgg()
 	alienRef = found
 
 	if found then
+		Alien.landed = true
 		Alien.miss = 0
 		Alien.seenWorld = Fn.alienWorld(found) or Alien.seenWorld
 		if Alien.seenWorld then Alien.hint = Alien.seenWorld end
@@ -1553,10 +1556,13 @@ function Fn.onAlienEvent(source, ...)
 	end
 	if world then Alien.hint, Alien.hintSince = world, nil end
 
-	-- A fresh announcement or landing starts the search over.
+	-- An announcement starts a new event; the landing message is the egg arriving.
+	if source:find("Announce", 1, true) then
+		Alien.landed = false
+		table.clear(Alien.travelled)
+	end
+	if source:find("Fall", 1, true) then Alien.landed = true end
 	if source:find("Announce", 1, true) or source:find("Fall", 1, true) then
-		table.clear(Alien.searched)
-		Alien.pausedUntil = 0
 		task.spawn(pcall, Fn.scanEgg)
 	end
 end
@@ -1612,59 +1618,43 @@ function Fn.returnFromAlien()
 	Fn.returnToPlace(home, function() return not Fn.alienGone() end)
 end
 
--- No egg in view: look for it in the world the server named, or in each world in turn.
-function Fn.searchWorlds()
-	if os.clock() < Alien.pausedUntil then return end
-
-	for _, world in ipairs(ALIEN_WORLD_ORDER) do
-		if Fn.alienGone() or (alienRef and alienRef.Parent) then return end
-		if not Alien.searched[world] and Fn.currentWorld() ~= world and Fn.isWorldOwned(world) ~= false then
-			Alien.searched[world] = true
-			Fn.setFeature("alien", "searching " .. Fn.worldLabel(world) .. " for the egg")
-
-			if Fn.travelToWorld(world, nil, Fn.alienGone) then
-				for _ = 1, 6 do -- let the world load in, checking as it does
-					task.wait(0.5)
-					pcall(Fn.scanEgg)
-					if Fn.alienGone() or (alienRef and alienRef.Parent) then return end
-				end
-			end
-		end
-	end
-
-	-- Nothing anywhere yet (it may still be falling): start over after a pause.
-	table.clear(Alien.searched)
-	Alien.pausedUntil = os.clock() + 15
-	Fn.setFeature("alien", "egg not found yet, looking again shortly (" .. (Alien.log ~= "" and Alien.log or "no server message") .. ")")
-end
-
+-- Goes to the egg's world once, and only after the egg has landed. When the server has
+-- not named a world, nothing moves: the character stays put until the egg is seen or named.
 function Fn.findAlienEgg()
-	local hint = Alien.hint
-	if hint then
-		local world = Fn.normWorld(hint)
-		if Fn.currentWorld() ~= world then
-			if os.clock() - alienLastTravel > 10 then
-				alienLastTravel = os.clock()
-				Alien.hintSince = nil
-				Fn.setFeature("alien", "going to " .. Fn.worldLabel(world) .. " for the egg")
-				Fn.travelToWorld(world, nil, Fn.alienGone)
-				task.wait(1)
-				pcall(Fn.scanEgg)
-			end
-			return
-		end
-
-		-- In the named world: give the egg a while to show up before doubting the name.
-		Alien.hintSince = Alien.hintSince or os.clock()
-		if os.clock() - Alien.hintSince <= 20 then
-			Fn.setFeature("alien", "in " .. Fn.worldLabel(world) .. ", waiting for the egg")
-			pcall(Fn.scanEgg)
-			return
-		end
-		Alien.hint, Alien.hintSince = nil, nil
+	if not Alien.landed then
+		Fn.setFeature("alien", "waiting for the egg to land")
+		return
 	end
 
-	Fn.searchWorlds()
+	local hint = Alien.hint
+	if not hint then
+		Fn.setFeature("alien", "egg landed, world not named yet")
+		return
+	end
+
+	local world = Fn.normWorld(hint)
+	if Fn.currentWorld() ~= world then
+		if not Alien.travelled[world] then
+			Alien.travelled[world] = true
+			Alien.hintSince = nil
+			Fn.setFeature("alien", "going to " .. Fn.worldLabel(world) .. " for the egg")
+			Fn.travelToWorld(world, nil, Fn.alienGone)
+			task.wait(1)
+			pcall(Fn.scanEgg)
+		else
+			Fn.setFeature("alien", "waiting for the egg in " .. Fn.worldLabel(world))
+		end
+		return
+	end
+
+	-- In the named world: give the egg a while to show up before doubting the name.
+	Alien.hintSince = Alien.hintSince or os.clock()
+	if os.clock() - Alien.hintSince <= 20 then
+		Fn.setFeature("alien", "in " .. Fn.worldLabel(world) .. ", waiting for the egg")
+		pcall(Fn.scanEgg)
+		return
+	end
+	Alien.hint, Alien.hintSince = nil, nil
 end
 
 -- Highest priority task in the script. While an egg is up (or on its way) everything
@@ -1673,6 +1663,8 @@ end
 function Fn.alienStep()
 	if Fn.alienGone() then
 		if alienHome then Fn.returnFromAlien() end
+		Alien.landed = false
+		table.clear(Alien.travelled)
 		Fn.setClaim("alien", false)
 		if alienForcedFarm then
 			alienForcedFarm = false
@@ -1698,10 +1690,12 @@ function Fn.alienStep()
 		return
 	end
 
-	-- One world teleport per attempt window. If the zone never confirms (it can
-	-- lag), carry on and click rather than re-teleporting every tick.
+	-- One world teleport per world for this egg. If the zone never confirms (it can
+	-- lag), carry on and click rather than teleporting again.
 	local world = Fn.alienWorld(egg)
-	if world and Fn.currentWorld() ~= Fn.normWorld(world) and os.clock() - alienLastTravel > 10 then
+	local normal = world and Fn.normWorld(world)
+	if normal and Fn.currentWorld() ~= normal and not Alien.travelled[normal] then
+		Alien.travelled[normal] = true
 		alienLastTravel = os.clock()
 		Fn.travelToWorld(world)
 		return -- re-check next tick: the egg may have moved or despawned meanwhile
