@@ -2,7 +2,7 @@
 	NisulRocks - Pets Universe Auto Farm
 	GameId 10759638075 | PlaceId 74629631798007
 
-	V1.0.3
+	V1.0.4
 
 	Feature set based on the open-source Pets Universe script by @hidevin,
 	rebuilt in the NisulRocks format (Rayfield, key system, state-driven loops).
@@ -13,7 +13,7 @@ if game.GameId ~= 10759638075 then return end -- Pets Universe only
 local KeySystem = loadstring(game:HttpGet("https://raw.githubusercontent.com/Nisulrocks/Key-system/refs/heads/main/Main"))()
 
 KeySystem.Config.ScriptName = "NisulRocks PU AutoFarm"
-KeySystem.Config.Version    = "V1.0.3"
+KeySystem.Config.Version    = "V1.0.4"
 
 KeySystem.Config.StorageId  = "NisulRocks_PU_AutoFarm"          -- STABLE ID
 KeySystem.Config.CorrectKey = "PetUniverseRelease"
@@ -115,7 +115,7 @@ local State = {
 	-- fishing
 	autoFish        = false,
 	fishWorld       = "Spawn",
-	fishTapInterval = 0.7,
+	fishTapInterval = 0.25,
 	autoFishBoosts  = false,       -- worms and hooks while fishing
 	boostItems      = {},          -- set of worm / hook item ids to use (empty = none)
 	autoSellFish    = false,
@@ -2809,13 +2809,12 @@ end, function() return 2 end, 0.1)
 -----------------------------------------------------------
 
 -- How the game's fishing minigame works (read from its own modules):
---   * FishingService.StartFishing() opens a session near water and returns a
---     TapSeed. Water is any part tagged "FishingWater"; the cast reaches 16
---     studs, and walking more than 8 studs from where it started ends it.
---   * Each cast takes 10s. SpeedUp(tapIndex, x, y) shortens it by tapping a
---     target; x/y are 0-1 screen positions. The server regenerates the target
---     for that index from the TapSeed (FishingTaps.NewSequence) and accepts a
---     tap that lands within HIT_X / HIT_Y of it.
+--   * Fishing starts at the water (the prompt, or FishingService.StartFishing).
+--     Water is any part tagged "FishingWater"; the cast reaches 16 studs, and
+--     walking more than 8 studs from where it started ends it.
+--   * Each cast takes about 10s. Tapping the halo the game draws on screen
+--     (PlayerGui.FishingGui.Fishing.TapHalo) shortens it; the game's own client
+--     reports those taps, so the script just presses the halo like a player.
 --   * The server recasts by itself after a catch, so fishing is just: start,
 --     keep tapping, stay put. Eggs cannot be hatched while fishing.
 
@@ -2848,135 +2847,25 @@ local Fish = {
 	replyIndex = nil,      -- the tap index in the server's last answer
 	replyAt    = nil,      -- when that answer arrived
 	lastSendAt = -math.huge,
-	plan       = 1,        -- which way of sending a tap is being used (see TAP_PLANS)
+	variant    = 1,        -- which way of pressing the halo is in use (see Fn.tapVariants)
+	variantCycles = 0,
+	haloText   = "halo not looked for yet",
 	planRejects = 0,
 	cycled     = 0,        -- full passes through every plan without a single accepted tap
 	won        = false,    -- the current plan has been accepted by the server
 	restUntil  = 0,        -- taps are paused until then (the cast still finishes by itself)
 	lastSent   = "",
 	catches    = nil,
+	clicks     = 1,        -- clicks sent per call (climbs while more clicks keep paying off)
+	clickCap   = 10,       -- the most the server has taken so far
+	stat       = {},       -- clicks -> { calls, saved seconds, seconds spent }, measured from the replies
+	saveLog    = 0,
+	catchLog   = 0,
+	rejectLog  = 0,
+	castSaved  = 0,        -- seconds the taps have taken off the cast in progress
+	lastCatchAt = nil,
+	catchGap   = nil,      -- seconds between the last catches, the figure that really counts
 }
-
--- Ways of sending one tap, tried in this order until the server accepts one. The
--- target always comes from the game's own tap sequence. The game's client sends
--- SpeedUp(index, x, y, clicks); the server accepts a single click per call, and it
--- moves the target on by itself (about 0.8 indexes per second), so the index has to
--- be read fresh every time. Counted clicks and a full count of 10 are rejected.
---   idx    "fresh" (asked of the server now), "fresh1" (one ahead) or "reply" (from its last answer)
---   clicks the count sent as the fourth value, or false for the old three-argument call
-local TAP_PLANS = {
-	{ idx = "fresh",  clicks = 1 },
-	{ idx = "fresh1", clicks = 1 },
-	{ idx = "reply",  clicks = 1 },
-	{ idx = "fresh",  clicks = false },
-}
-
-local TAP_INDEX_RATE = 0.805 -- target indexes the server advances per second (measured from its answers)
-
--- Tap sources ---------------------------------------------------------------
-
-function Fn.inUnitRange(x, y)
-	return type(x) == "number" and type(y) == "number" and x >= 0 and x <= 1 and y >= 0 and y <= 1
-end
-
--- Accepts (x, y), a Vector2, or a table holding x/y; returns nil otherwise.
-function Fn.toXY(a, b)
-	if type(a) == "number" and type(b) == "number" then return a, b end
-	if typeof(a) == "Vector2" then return a.X, a.Y end
-	if type(a) == "table" then
-		local x = a.x or a.X or a[1]
-		local y = a.y or a.Y or a[2]
-		if type(x) == "number" and type(y) == "number" then return x, y end
-	end
-	return nil
-end
-
--- FishingTaps.NewSequence(seed) is what the server uses to place each target,
--- so asking it gives the exact position for every index. The shape it returns
--- is not documented (a function, an object with a next-style method, or a
--- list), so every shape is handled; the server's own Accepted flag decides
--- whether the guess was right.
-function Fn.newTapSource(seed)
-	local mod = Fn.getModule("FishTaps")
-	if not (mod and type(mod.NewSequence) == "function") then return nil end
-
-	local ok, seq = pcall(mod.NewSequence, seed)
-	if not ok or seq == nil then
-		Fish.seqInfo = "NewSequence failed: " .. tostring(seq)
-		return nil
-	end
-	Fish.seqInfo = typeof(seq)
-
-	local steps, produced = {}, 0
-
-	local function advance(index)
-		if type(seq) == "function" then
-			local r = table.pack(pcall(seq, index))
-			if r[1] then return Fn.toXY(r[2], r[3]) end
-			return nil
-		end
-
-		if type(seq) == "table" then
-			for _, name in ipairs({ "Next", "next", "Step", "Get", "At", "Pop" }) do
-				local fn = seq[name]
-				if type(fn) == "function" then
-					local x, y
-					local r = table.pack(pcall(fn, seq, index)) -- as a method
-					if r[1] then x, y = Fn.toXY(r[2], r[3]) end
-					if x then return x, y end
-
-					r = table.pack(pcall(fn, index)) -- as a plain function
-					if r[1] then x, y = Fn.toXY(r[2], r[3]) end
-					if x then return x, y end
-				end
-			end
-			if seq[index] ~= nil then return Fn.toXY(seq[index]) end
-		end
-		return nil
-	end
-
-	-- Stateful sequences only move forward, so produce every step up to the one asked for.
-	return function(index)
-		while produced < index do
-			produced = produced + 1
-			local x, y = advance(produced)
-			if not Fn.inUnitRange(x, y) then return nil end
-			steps[produced] = { x, y }
-		end
-		local s = steps[index]
-		if not s then return nil end
-		return s[1], s[2]
-	end
-end
-
--- Where the target for `index` is, from the game's tap sequence; nil when it cannot be told.
-function Fn.tapTarget(index)
-	local x, y
-	if Fish.tapAt then x, y = Fish.tapAt(index) end
-	if not x then return nil end
-	-- A hair of noise, well inside the hit box, so taps are not pixel-identical.
-	return x + (math.random() - 0.5) * 0.008, y + (math.random() - 0.5) * 0.008
-end
-
-function Fn.planText(plan)
-	return string.format("index %s | clicks %s", plan.idx, plan.clicks and tostring(plan.clicks) or "none")
-end
-
--- Moves on to the next way of sending a tap. Two full passes with nothing accepted
--- means the server is not taking taps right now: pause them and let the cast run out
--- by itself (fishing carries on without taps, just slower), then probe again later.
-function Fn.nextPlan()
-	Fish.plan = Fish.plan % #TAP_PLANS + 1
-	Fish.planRejects = 0
-	Fish.won = false
-	if Fish.plan == 1 then
-		Fish.cycled = Fish.cycled + 1
-		if Fish.cycled >= 2 then
-			Fish.cycled = 0
-			Fish.restUntil = os.clock() + 120
-		end
-	end
-end
 
 -- Session ---------------------------------------------------------------------
 
@@ -2992,14 +2881,6 @@ end
 -- Takes over the numbers of a session the server describes (from StartFishing or GetSession).
 function Fn.adoptSession(data)
 	Fish.active = true
-	if tonumber(data.TapIndex) then
-		Fish.index = tonumber(data.TapIndex)
-		Fish.replyAt = os.clock()
-	end
-	if data.TapSeed ~= nil and data.TapSeed ~= Fish.seed then
-		Fish.seed = data.TapSeed
-		Fish.tapAt = Fn.newTapSource(Fish.seed)
-	end
 	Fish.streak = tonumber(data.Streak) or Fish.streak
 	Fish.endsAt = tonumber(data.EndsAt) or Fish.endsAt
 	Fish.catches = tonumber(data.Catches) or Fish.catches
@@ -3011,18 +2892,6 @@ function Fn.getSession()
 	local data = ok and res[1]
 	if type(data) == "table" and (data.TapIndex ~= nil or data.EndsAt ~= nil) then return data end
 	return nil
-end
-
--- The tap index the server is on right now. It moves with time, so ask; if the
--- answer is unusable, carry the last known one forward at the measured rate.
-function Fn.currentIndex()
-	local session = Fn.getSession()
-	if session then
-		Fn.adoptSession(session)
-		if tonumber(session.TapIndex) then return tonumber(session.TapIndex) end
-	end
-	if Fish.replyAt then return Fish.index + math.floor((os.clock() - Fish.replyAt) * TAP_INDEX_RATE) end
-	return Fish.index
 end
 
 function Fn.startFishing()
@@ -3078,7 +2947,21 @@ end
 pcall(function()
 	local caught = Fn.knitRemote("FishingService", "RE", "Caught")
 	if caught then
-		caught.OnClientEvent:Connect(function(item, endsAt, _, catchNumber)
+		caught.OnClientEvent:Connect(function(item, endsAt, duration, catchNumber)
+			local at = os.clock()
+			if Fish.lastCatchAt and at - Fish.lastCatchAt < 30 then
+				local gap = at - Fish.lastCatchAt
+				Fish.catchGap = Fish.catchGap and (Fish.catchGap * 0.7 + gap * 0.3) or gap
+			end
+			if Fish.catchLog < 30 then
+				Fish.catchLog = Fish.catchLog + 1
+				warn(string.format("[PU fish] catch | time since last catch %s | next cast duration %s | next ends in %s | taps took %.2f s off this cast | streak %s",
+					Fish.lastCatchAt and string.format("%.1f s", at - Fish.lastCatchAt) or "?", tostring(duration),
+					tonumber(endsAt) and string.format("%.1f s", tonumber(endsAt) - Workspace:GetServerTimeNow()) or "?",
+					Fish.castSaved, tostring(Fish.streak)))
+			end
+			Fish.castSaved = 0
+			Fish.lastCatchAt = at
 			Fish.caught = Fish.caught + 1
 			Stats.fish = Stats.fish + 1
 			if type(item) == "table" then
@@ -3405,83 +3288,175 @@ end
 
 -- Main loop -------------------------------------------------------------------
 
+-- Tapping --------------------------------------------------------------------
+-- The game draws a halo where the next tap belongs (PlayerGui.FishingGui.Fishing.TapHalo)
+-- and counts the clicks itself. The script does what a player does: wait for the halo and
+-- press it, with the game's own client sending whatever it sends. Nothing here calls the
+-- fishing remotes for taps.
+
+-- Ways of pressing, tried in this order until one registers; the first that works is kept.
+--   signal      fires the halo's own click events (when it is a button)
+--   touch       a finger at the halo's centre (phones and tablets)
+--   mouse       a click at the halo's centre
+--   +inset      the same, shifted down by the top-bar inset (executors differ on which they expect)
+local TAP_VARIANTS_TOUCH = { "signal", "touch", "touch+inset", "mouse", "mouse+inset" }
+local TAP_VARIANTS_MOUSE = { "signal", "mouse", "mouse+inset", "touch", "touch+inset" }
+
+function Fn.tapVariants()
+	local UIS = game:GetService("UserInputService")
+	if UIS.TouchEnabled and not UIS.MouseEnabled then return TAP_VARIANTS_TOUCH end
+	return TAP_VARIANTS_MOUSE
+end
+
+function Fn.findHalo()
+	local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui")
+	local fishing = gui and gui:FindFirstChild("FishingGui")
+	if not fishing then return nil end
+	local main = fishing:FindFirstChild("Fishing")
+	return (main and main:FindFirstChild("TapHalo")) or fishing:FindFirstChild("TapHalo", true)
+end
+
+-- The halo's centre on screen when it is showing, else nil.
+function Fn.haloCenter(halo)
+	if not (halo and halo:IsA("GuiObject")) then return nil end
+	local cur = halo
+	while cur and cur:IsA("GuiObject") do
+		if not cur.Visible then return nil end
+		cur = cur.Parent
+	end
+	local screen = halo:FindFirstAncestorOfClass("ScreenGui")
+	if screen and not screen.Enabled then return nil end
+
+	local size = halo.AbsoluteSize
+	if size.X < 2 or size.Y < 2 then return nil end
+	local center = halo.AbsolutePosition + size / 2
+
+	local camera = Workspace.CurrentCamera
+	local view = camera and camera.ViewportSize
+	if view and (center.X < 0 or center.Y < 0 or center.X > view.X or center.Y > view.Y) then return nil end
+	return center, size
+end
+
+-- One press by the named way. True if it could be sent at all.
+function Fn.pressHalo(variant, halo, x, y)
+	if variant == "signal" then
+		if not (halo:IsA("GuiButton") and typeof(firesignal) == "function") then return false end
+		local fired = false
+		for _, name in ipairs({ "MouseButton1Down", "MouseButton1Click", "Activated", "MouseButton1Up" }) do
+			local signal = halo[name]
+			if signal then fired = pcall(firesignal, signal) or fired end
+		end
+		return fired
+	end
+
+	local gotVim, vim = pcall(function() return game:GetService("VirtualInputManager") end)
+	if not (gotVim and vim) then return false end
+
+	if string.find(variant, "+inset", 1, true) then
+		local okInset, inset = pcall(function() return game:GetService("GuiService"):GetGuiInset() end)
+		if okInset then y = y + inset.Y end
+	end
+
+	-- Pressed and released on consecutive frames, no added delay.
+	if string.sub(variant, 1, 5) == "touch" then
+		return (pcall(function()
+			vim:SendTouchEvent(1, 0, x, y)
+			RunService.Heartbeat:Wait()
+			vim:SendTouchEvent(1, 2, x, y)
+		end))
+	end
+	return (pcall(function()
+		vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
+		RunService.Heartbeat:Wait()
+		vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+	end))
+end
+
+-- How the game scores a tap, readable on our own player: the streak luck goes up with
+-- every tap the game counted.
+function Fn.tapScore()
+	return tonumber(LocalPlayer:GetAttribute("FishingStreakLuck")) or 0
+end
+
+local TAP_BURST   = 6    -- presses on one target before this way of pressing counts as failed
+local TAP_RETRY    = 0.22 -- seconds between presses on the same target (the server allows one per 0.2s)
+
+-- One target: press the halo, and keep pressing it until the game answers. A press can land
+-- while the halo is still sliding in or settling, so a single try now and then goes nowhere;
+-- a player just taps again, and so does this.
 function Fn.tapOnce()
 	local now = os.clock()
-	if now < (Fish.nextTapAt or 0) or now < Fish.restUntil then return end
+	if now < (Fish.nextTapAt or 0) then return end
 
 	local cfg = Fn.getModule("FishCfg") or {}
 	local minGap = tonumber(cfg.SPEEDUP_MIN_INTERVAL) or 0.2
 
-	local plan = TAP_PLANS[Fish.plan]
+	local halo = Fn.findHalo()
+	local center, size = Fn.haloCenter(halo)
+	if not center then
+		Fish.haloText = halo and "halo hidden" or "halo not found"
+		Fish.nextTapAt = now + 0.15
+		return
+	end
+	Fish.haloText = "halo showing"
 
-	-- A person needs a moment between a target appearing and tapping it, and the server
-	-- bans taps that arrive instantly. A short random pause comes first; the index is
-	-- read after it, right before sending, because the index keeps moving.
-	task.wait(0.08 + math.random() * 0.12)
-	local index = Fn.currentIndex()
-	if plan.idx == "fresh1" then
-		index = index + 1
-	elseif plan.idx == "reply" and Fish.replyIndex then
-		index = Fish.replyIndex
+	local variants = Fn.tapVariants()
+	local variant = variants[Fish.variant] or variants[1]
+	local scoreBefore, centerBefore = Fn.tapScore(), center
+	local firstPress = nil
+	local registered, available = false, true
+
+	for press = 1, TAP_BURST do
+		if not Fish.active then return end
+
+		-- Aim at where the halo is right now: it may have moved since the last press.
+		center, size = Fn.haloCenter(halo)
+		if not center then
+			registered = true -- gone: the game took the tap and moved on
+			break
+		end
+		local spread = math.min(size.X, size.Y) * 0.18
+		local x = center.X + (math.random() * 2 - 1) * spread
+		local y = center.Y + (math.random() * 2 - 1) * spread
+
+		Fish.sent = Fish.sent + 1
+		firstPress = firstPress or os.clock()
+		available = Fn.pressHalo(variant, halo, x, y)
+		Fish.lastSent = string.format("%s at %d, %d%s", variant, x, y, available and "" or " (could not be sent)")
+		if not available then break end
+
+		-- The tap counts when the game's score moves or the halo moves on to its next place.
+		local until_ = os.clock() + TAP_RETRY
+		while os.clock() < until_ do
+			RunService.Heartbeat:Wait()
+			local moved = Fn.haloCenter(halo)
+			if Fn.tapScore() ~= scoreBefore or not moved or (moved - centerBefore).Magnitude > 12 then
+				registered = true
+				break
+			end
+		end
+		if registered then break end
 	end
 
-	local clicks = plan.clicks or nil
-
-	local found, x, y = pcall(Fn.tapTarget, index)
-	if not found then x, y = nil, nil end
-	if not x then
-		Fish.lastReply = "the tap sequence gave no target for index " .. tostring(index)
-		Fn.nextPlan()
-		Fish.nextTapAt = now + 0.2
+	if registered then
+		local took = os.clock() - (firstPress or os.clock())
+		Fish.answerTime = Fish.answerTime and (Fish.answerTime * 0.7 + took * 0.3) or took
+		Fish.accepted = Fish.accepted + 1
+		Fish.rejects = 0
+		Fish.streak = Fish.streak + 1
+		Fish.nextTapAt = (firstPress or os.clock()) + math.max(minGap, State.fishTapInterval)
 		return
 	end
 
-	Fish.lastTap = { x, y }
-	Fish.sent = Fish.sent + 1
-	Fish.lastSendAt = now
-	Fish.lastSent = string.format("index %d, x %.3f, y %.3f, clicks %s", index, x, y, clicks and tostring(clicks) or "none")
-
-	-- FishingService.RF.SpeedUp:InvokeServer(tapIndex, x, y, clicks)
-	local ok, res
-	if clicks then
-		ok, res = Fn.invoke("FishingService", "SpeedUp", index, x, y, clicks)
-	else
-		ok, res = Fn.invoke("FishingService", "SpeedUp", index, x, y)
-	end
-	local r = res[1]
-
-	if type(r) == "table" then
-		if type(r.TapIndex) == "number" then
-			Fish.index, Fish.replyIndex, Fish.replyAt = r.TapIndex, r.TapIndex, os.clock()
-		end
-		if tonumber(r.EndsAt) then Fish.endsAt = tonumber(r.EndsAt) end
-
-		if r.Accepted then
-			Fish.accepted = Fish.accepted + 1
-			Fish.rejects, Fish.planRejects, Fish.cycled = 0, 0, 0
-			Fish.won = true
-			Fish.streak = tonumber(r.Streak) or Fish.streak
-			-- Tap at the player's chosen pace, never faster than the server's minimum gap.
-			-- (with a little random variation, so the rhythm is not metronome-perfect)
-			Fish.nextTapAt = os.clock() + math.max(minGap, State.fishTapInterval) * (0.9 + math.random() * 0.3)
-			return
-		end
-	end
-
-	-- Rejected or unanswered. A tap can miss because the target moved on while it was in
-	-- flight, so a few misses are normal; several in a row means this way of sending is
-	-- wrong, and the next one is tried. Keep the server's words for the status line.
-	Fish.lastReply = Fn.describe(r)
-	Fish.nextTapAt = os.clock() + (Fish.won and 1.2 or math.max(1, State.fishTapInterval))
+	-- A whole burst went unanswered: this way of pressing may not reach the game on this
+	-- device (or the cast is between targets). After a couple of bursts the next way is tried.
 	Fish.rejects = Fish.rejects + 1
-	Fish.planRejects = Fish.planRejects + 1
-	if Fish.planRejects >= (Fish.won and 6 or 3) then Fn.nextPlan() end
-
-	Fish.failStreak = Fish.failStreak + (ok and 0 or 1)
-	if not ok and Fish.failStreak >= 4 then
-		Fish.active = false
-		Fish.failStreak = 0
-		Fish.lastStop = "session stopped answering"
+	Fish.lastReply = available and "no answer to a burst of presses" or "this way of pressing is not available here"
+	Fish.nextTapAt = os.clock() + 0.2
+	if Fish.rejects >= (available and 2 or 1) then
+		Fish.rejects = 0
+		Fish.variant = Fish.variant % #variants + 1
+		Fish.variantCycles = Fish.variantCycles + 1
 	end
 end
 
@@ -3493,14 +3468,12 @@ function Fn.fishStatus()
 		Fish.caught, Fish.catches and (" (session " .. Fish.catches .. ")") or "", Fish.streak, Fish.lastCatch,
 		left and string.format(" | next catch in %.0fs", left) or "")
 
-	if os.clock() < Fish.restUntil then
-		text = text .. string.format("\ntaps paused %.0fs: the server is not taking them, the cast finishes by itself",
-			Fish.restUntil - os.clock())
-	else
-		text = text .. string.format("\ntaps %d/%d accepted | %s", Fish.accepted, Fish.sent, Fn.planText(TAP_PLANS[Fish.plan]))
-	end
+	local variants = Fn.tapVariants()
+	text = text .. string.format("\ntargets %d answered, %d presses | %s | %s%s", Fish.accepted, Fish.sent,
+		variants[Fish.variant] or variants[1], Fish.haloText,
+		Fish.answerTime and string.format(" | game answers in %.2fs", Fish.answerTime) or "")
 	if Fish.rejects > 0 then
-		text = text .. string.format("\nrejected %dx - server said: %s\nsent: %s", Fish.rejects, tostring(Fish.lastReply), Fish.lastSent)
+		text = text .. string.format("\nno reaction %dx - %s\nlast: %s", Fish.rejects, tostring(Fish.lastReply), Fish.lastSent)
 	end
 	return text
 end
@@ -3571,7 +3544,7 @@ function Fn.fishStep()
 end
 
 Fn.runLoop("Fishing", function() return State.autoFish end, Fn.fishStep,
-	function() return Fish.active and math.clamp(State.fishTapInterval, 0.4, 2) or 1.5 end, 0.15)
+	function() return Fish.active and math.clamp(State.fishTapInterval * 0.5, 0.1, 1) or 1.5 end, 0.1)
 
 -- Leaves the session cleanly the moment the toggle goes off.
 function Fn.setAutoFish(on)
@@ -4375,7 +4348,7 @@ Fn.runLoop("FishMerchant",
 local HUB = {
 	Name    = "NisulRocks Script Hub",
 	Game    = "Pets Universe",
-	Version = "V1.0.3",
+	Version = "V1.0.4",
 	Invite  = "https://discord.gg/jUctfTAa5D",
 	Red     = 0xFF1E1E, -- the hub's neon red
 	Green   = 0x00FF78,
@@ -4993,8 +4966,8 @@ warn("[PU DEBUG] After Rayfield")
 env.NisulPURayfield = Rayfield
 
 local windowOk, Window = pcall(Rayfield.CreateWindow, Rayfield, {
-	Name = "Pets Universe V1.0.3",
-	LoadingTitle = "PU Auto Farm V1.0.3",
+	Name = "Pets Universe V1.0.4",
+	LoadingTitle = "PU Auto Farm V1.0.4",
 	LoadingSubtitle = "by NisulRocks | Made with love",
 	ShowText = "PU Auto Farm",
 	Theme = "Default",
@@ -5397,8 +5370,8 @@ Fn.addDropdown(FishingTab, "Fishing/World", "Fishing World", "FishWorld", FISH_W
 	State.fishWorld = Fn.fishWorldKey(Fn.firstOption(s))
 end)
 
-Fn.addSlider(FishingTab, "Fishing/Interval", "Tap Interval", "FishTapInterval", { 0.4, 2 }, 0.05, "s", State.fishTapInterval, function(v)
-	State.fishTapInterval = v -- the server allows a tap every 0.2s; the game's own pace is about 0.7s
+Fn.addSlider(FishingTab, "Fishing/Interval", "Tap Interval", "FishTapInterval2", { 0.2, 2 }, 0.05, "s", State.fishTapInterval, function(v)
+	State.fishTapInterval = v -- the server allows a call every 0.2s
 end)
 
 Fn.addButton(FishingTab, "Fishing/Here", "Fish Here (start where I stand)", Fn.fishHere)
@@ -5741,12 +5714,12 @@ end
 
 Fn.setStatus("Ready")
 
-print("Nisulrocks Scripts Pets Universe AutoFarm V1.0.3 loaded successfully!")
+print("Nisulrocks Scripts Pets Universe AutoFarm V1.0.4 loaded successfully!")
 if #UIErrors > 0 then
 	warn("[PU] " .. #UIErrors .. " UI element(s) failed - see Script tab Diagnostics")
 end
 
-Fn.notify("System Ready", "Welcome to NisulRocks PU AutoFarm V1.0.3", 5)
+Fn.notify("System Ready", "Welcome to NisulRocks PU AutoFarm V1.0.4", 5)
 
 end, function(err)
 	return debug.traceback(tostring(err), 2)
