@@ -3294,18 +3294,50 @@ end
 -- press it, with the game's own client sending whatever it sends. Nothing here calls the
 -- fishing remotes for taps.
 
--- Ways of pressing, tried in this order until one registers; the first that works is kept.
---   signal      fires the halo's own click events (when it is a button)
---   touch       a finger at the halo's centre (phones and tablets)
---   mouse       a click at the halo's centre
---   +inset      the same, shifted down by the top-bar inset (executors differ on which they expect)
-local TAP_VARIANTS_TOUCH = { "signal", "touch", "touch+inset", "mouse", "mouse+inset" }
-local TAP_VARIANTS_MOUSE = { "signal", "mouse", "mouse+inset", "touch", "touch+inset" }
+-- Screen position the input system expects for a point of a GUI object. A ScreenGui that
+-- respects the top-bar inset reports positions measured from below the bar, while the
+-- virtual input manager works from the top of the window, so the inset has to be added back
+-- (phones included, where the bar and any notch shift everything). "auto" works that out from
+-- the halo's own ScreenGui, "raw" adds nothing, "inset" always adds the full inset.
+function Fn.guiOffset(mode, halo)
+	if mode == "raw" then return Vector2.zero end
+	local okInset, inset = pcall(function() return game:GetService("GuiService"):GetGuiInset() end)
+	if not okInset then inset = Vector2.zero end
+	if mode == "inset" then return inset end
 
+	local screen = halo and halo:FindFirstAncestorOfClass("ScreenGui")
+	if screen then
+		if screen.IgnoreGuiInset then return Vector2.zero end
+		local okMode, insets = pcall(function() return screen.ScreenInsets end)
+		if okMode and insets == Enum.ScreenInsets.None then return Vector2.zero end
+	end
+	return inset
+end
+
+-- Ways of pressing, tried in this order until one registers; the first that works is kept.
+--   signal            fires the halo's own click events (when it is a button)
+--   touch/<offset>    a finger at the halo's centre (phones and tablets)
+--   mouse/<offset>    a click at the halo's centre
+-- The device's own kind comes first, and an offset that would repeat an earlier one is left out.
 function Fn.tapVariants()
+	local halo = Fn.findHalo()
+	local offsets, seen = {}, {}
+	for _, mode in ipairs({ "auto", "raw", "inset" }) do
+		local value = Fn.guiOffset(mode, halo)
+		local key = math.floor(value.X) .. "," .. math.floor(value.Y)
+		if not seen[key] then
+			seen[key] = true
+			offsets[#offsets + 1] = mode
+		end
+	end
+
 	local UIS = game:GetService("UserInputService")
-	if UIS.TouchEnabled and not UIS.MouseEnabled then return TAP_VARIANTS_TOUCH end
-	return TAP_VARIANTS_MOUSE
+	local kinds = (UIS.TouchEnabled and not UIS.MouseEnabled) and { "touch", "mouse" } or { "mouse", "touch" }
+	local list = { "signal" }
+	for _, kind in ipairs(kinds) do
+		for _, mode in ipairs(offsets) do list[#list + 1] = kind .. "/" .. mode end
+	end
+	return list
 end
 
 function Fn.findHalo()
@@ -3352,13 +3384,12 @@ function Fn.pressHalo(variant, halo, x, y)
 	local gotVim, vim = pcall(function() return game:GetService("VirtualInputManager") end)
 	if not (gotVim and vim) then return false end
 
-	if string.find(variant, "+inset", 1, true) then
-		local okInset, inset = pcall(function() return game:GetService("GuiService"):GetGuiInset() end)
-		if okInset then y = y + inset.Y end
-	end
+	local kind, mode = string.match(variant, "^(%a+)/(%a+)$")
+	local shift = Fn.guiOffset(mode or "raw", halo)
+	x, y = x + shift.X, y + shift.Y
 
 	-- Pressed and released on consecutive frames, no added delay.
-	if string.sub(variant, 1, 5) == "touch" then
+	if kind == "touch" then
 		return (pcall(function()
 			vim:SendTouchEvent(1, 0, x, y)
 			RunService.Heartbeat:Wait()
@@ -3401,12 +3432,20 @@ function Fn.tapOnce()
 	Fish.haloText = "halo showing"
 
 	local variants = Fn.tapVariants()
+	if Fish.variantName then
+		for i, name in ipairs(variants) do
+			if name == Fish.variantName then Fish.variant = i end
+		end
+	end
 	local variant = variants[Fish.variant] or variants[1]
+	local proven = Fish.variantName == variant
 	local scoreBefore, centerBefore = Fn.tapScore(), center
 	local firstPress = nil
 	local registered, available = false, true
 
-	for press = 1, TAP_BURST do
+	-- A way of pressing that has worked gets the full burst; one still being tried gets a
+	-- short one, so a wrong position (off-centre on a phone, say) is dropped quickly.
+	for press = 1, (proven and TAP_BURST or 3) do
 		if not Fish.active then return end
 
 		-- Aim at where the halo is right now: it may have moved since the last press.
@@ -3441,6 +3480,7 @@ function Fn.tapOnce()
 	if registered then
 		local took = os.clock() - (firstPress or os.clock())
 		Fish.answerTime = Fish.answerTime and (Fish.answerTime * 0.7 + took * 0.3) or took
+		Fish.variantName = variant
 		Fish.accepted = Fish.accepted + 1
 		Fish.rejects = 0
 		Fish.streak = Fish.streak + 1
@@ -3453,8 +3493,9 @@ function Fn.tapOnce()
 	Fish.rejects = Fish.rejects + 1
 	Fish.lastReply = available and "no answer to a burst of presses" or "this way of pressing is not available here"
 	Fish.nextTapAt = os.clock() + 0.2
-	if Fish.rejects >= (available and 2 or 1) then
+	if Fish.rejects >= ((available and proven) and 2 or 1) then
 		Fish.rejects = 0
+		Fish.variantName = nil
 		Fish.variant = Fish.variant % #variants + 1
 		Fish.variantCycles = Fish.variantCycles + 1
 	end
@@ -5362,7 +5403,27 @@ local FishingTab = Window:CreateTab("Fishing", ICON_ID)
 
 Fn.safeUI("Fishing/Section", function() FishingTab:CreateSection("Auto Fish") end)
 
-Fn.addToggle(FishingTab, "Fishing/Auto", "Auto Fish", "AutoFish", false, Fn.setAutoFish)
+Fn.FishToggle = Fn.addToggle(FishingTab, "Fishing/Auto", "Auto Fish", "AutoFish", false, Fn.setAutoFish)
+
+-- A key that starts and stops Auto Fish. Click the box in the menu and press the key you want;
+-- it is saved with the rest of the settings. (Phones have no keyboard, so use the toggle there.)
+Fn.safeUI("Fishing/Hotkey", function()
+	return FishingTab:CreateKeybind({
+		Name = "Auto Fish Hotkey",
+		CurrentKeybind = "G",
+		HoldToInteract = false,
+		Flag = "AutoFishHotkey",
+		Callback = function()
+			local turnOn = not State.autoFish
+			if Fn.FishToggle and type(Fn.FishToggle.Set) == "function" then
+				Fn.FishToggle:Set(turnOn) -- keeps the switch in the menu in step
+			else
+				Fn.setAutoFish(turnOn)
+			end
+			Fn.notify("Auto Fish", turnOn and "Started" or "Stopped", 2)
+		end,
+	})
+end)
 
 local FISH_WORLDS = { "Spawn", "Treasure Dunes", "Haunted House" }
 
