@@ -16,7 +16,7 @@ local Player = Players.LocalPlayer
 
 local DISCORD_INVITE = "jUctfTAa5D"
 
-local MESSAGE = "Greeting Script user, It has come to my attention that Pet Universe is currently going through a ban wave, in order to protect you from getting banned, i have chosen to disable This script."
+local MESSAGE = "Greetings Script user, It has come to my attention that Pet Universe is currently going through a ban wave, in order to protect you from getting banned, i have chosen to disable This script."
 local SIGN_OFF = "- <font color='#ff3333'>Nisulrocks Scripts</font>"
 
 -- Red Protocol V8 Color Palette (same as the Script Hub)
