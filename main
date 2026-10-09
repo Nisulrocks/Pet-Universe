@@ -2849,6 +2849,7 @@ local Fish = {
 	lastSendAt = -math.huge,
 	variant    = 1,        -- which way of pressing the halo is in use (see Fn.tapVariants)
 	variantCycles = 0,
+	cal        = {},       -- where presses land, measured once per kind of press and window size
 	haloText   = "halo not looked for yet",
 	planRejects = 0,
 	cycled     = 0,        -- full passes through every plan without a single accepted tap
@@ -3315,7 +3316,7 @@ function Fn.guiOffset(mode, halo)
 end
 
 -- Ways of pressing, tried in this order until one registers; the first that works is kept.
---   signal            fires the halo's own click events (when it is a button)
+--   events            runs what the game hooked to the halo, no screen press at all (see Fn.fireHaloEvents)
 --   touch/<offset>    a finger at the halo's centre (phones and tablets)
 --   mouse/<offset>    a click at the halo's centre
 -- The device's own kind comes first, and an offset that would repeat an earlier one is left out.
@@ -3333,7 +3334,7 @@ function Fn.tapVariants()
 
 	local UIS = game:GetService("UserInputService")
 	local kinds = (UIS.TouchEnabled and not UIS.MouseEnabled) and { "touch", "mouse" } or { "mouse", "touch" }
-	local list = { "signal" }
+	local list = { "events" }
 	for _, kind in ipairs(kinds) do
 		for _, mode in ipairs(offsets) do list[#list + 1] = kind .. "/" .. mode end
 	end
@@ -3369,26 +3370,136 @@ function Fn.haloCenter(halo)
 	return center, size
 end
 
--- One press by the named way. True if it could be sent at all.
-function Fn.pressHalo(variant, halo, x, y)
-	if variant == "signal" then
-		if not (halo:IsA("GuiButton") and typeof(firesignal) == "function") then return false end
-		local fired = false
-		for _, name in ipairs({ "MouseButton1Down", "MouseButton1Click", "Activated", "MouseButton1Up" }) do
-			local signal = halo[name]
-			if signal then fired = pcall(firesignal, signal) or fired end
+-- Clicking the halo without touching the screen: runs what the game has hooked to it.
+--   * a button (the halo, or one inside it) has its click signals fired
+--   * anything listening on the halo's own InputBegan/InputEnded is called with a press at (x, y)
+--   * the game's fishing client, if it watches UserInputService itself, is called the same way
+-- Needs firesignal and/or getconnections from the executor. False when nothing could be fired
+-- (so the next way of pressing is tried).
+local HALO_SIGNALS = { "MouseButton1Down", "MouseButton1Click", "Activated", "MouseButton1Up", "TouchTap", "TouchLongPress" }
+
+function Fn.haloTargets(halo)
+	local list = { halo }
+	for _, inst in ipairs(halo:GetDescendants()) do
+		if inst:IsA("GuiObject") then list[#list + 1] = inst end
+	end
+	return list
+end
+
+-- A stand-in for the InputObject a real press would have produced.
+function Fn.fakeInput(state, x, y)
+	local UIS = game:GetService("UserInputService")
+	local kind = (UIS.TouchEnabled and not UIS.MouseEnabled) and Enum.UserInputType.Touch or Enum.UserInputType.MouseButton1
+	return {
+		UserInputType = kind,
+		UserInputState = state,
+		KeyCode = Enum.KeyCode.Unknown,
+		Position = Vector3.new(x, y, 0),
+		Delta = Vector3.zero,
+		IsModifierKeyDown = function() return false end,
+	}
+end
+
+-- Callbacks the game's FishingClient registered on UserInputService.
+function Fn.fishingInputConnections(signalName)
+	local found = {}
+	if typeof(getconnections) ~= "function" then return found end
+	local ok, conns = pcall(getconnections, game:GetService("UserInputService")[signalName])
+	if not (ok and type(conns) == "table") then return found end
+	for _, conn in ipairs(conns) do
+		local fn = conn.Function
+		local owner
+		if typeof(fn) == "function" and typeof(getfenv) == "function" then
+			local gotEnv, env = pcall(getfenv, fn)
+			if gotEnv and type(env) == "table" then owner = rawget(env, "script") end
 		end
-		return fired
+		if typeof(owner) == "Instance" and string.find(string.lower(owner.Name), "fishing", 1, true) then
+			found[#found + 1] = conn
+		end
+	end
+	return found
+end
+
+function Fn.fireHaloEvents(halo, x, y)
+	local fired = 0
+	local canSignal = typeof(firesignal) == "function"
+	local canConnections = typeof(getconnections) == "function"
+	if not (canSignal or canConnections) then return false end
+
+	local function readSignal(obj, name)
+		local ok, signal = pcall(function() return obj[name] end)
+		return ok and typeof(signal) == "RBXScriptSignal" and signal or nil
 	end
 
+	for _, obj in ipairs(Fn.haloTargets(halo)) do
+		if obj:IsA("GuiButton") then
+			for _, name in ipairs(HALO_SIGNALS) do
+				local signal = readSignal(obj, name)
+				if signal then
+					if canSignal and pcall(firesignal, signal) then fired = fired + 1
+					elseif canConnections then
+						local ok, conns = pcall(getconnections, signal)
+						if ok then for _, c in ipairs(conns) do if pcall(function() c:Fire() end) then fired = fired + 1 end end end
+					end
+				end
+			end
+		end
+
+		-- Raw input handlers on the object itself.
+		for name, state in pairs({ InputBegan = Enum.UserInputState.Begin, InputEnded = Enum.UserInputState.End }) do
+			local signal = readSignal(obj, name)
+			if signal and canConnections then
+				local ok, conns = pcall(getconnections, signal)
+				if ok then
+					for _, c in ipairs(conns) do
+						if pcall(function() c:Fire(Fn.fakeInput(state, x, y), false) end) then fired = fired + 1 end
+					end
+				end
+			end
+		end
+	end
+
+	-- The fishing client's own listeners on UserInputService.
+	for name, state in pairs({ InputBegan = Enum.UserInputState.Begin, InputEnded = Enum.UserInputState.End }) do
+		for _, c in ipairs(Fn.fishingInputConnections(name)) do
+			if pcall(function() c:Fire(Fn.fakeInput(state, x, y), false) end) then fired = fired + 1 end
+		end
+	end
+
+	return fired > 0
+end
+
+-- What the halo is, once, so a way that does not work can be understood from the log.
+function Fn.describeHalo(halo)
+	if Fish.haloDescribed or not halo then return end
+	Fish.haloDescribed = true
+	local parts = { halo.ClassName }
+	local buttons, listeners = 0, 0
+	for _, obj in ipairs(Fn.haloTargets(halo)) do
+		if obj:IsA("GuiButton") then buttons = buttons + 1 end
+		if typeof(getconnections) == "function" then
+			for _, name in ipairs({ "InputBegan", "InputEnded", "MouseButton1Click", "Activated", "MouseButton1Down" }) do
+				local ok, signal = pcall(function() return obj[name] end)
+				if ok and typeof(signal) == "RBXScriptSignal" then
+					local okC, conns = pcall(getconnections, signal)
+					if okC and type(conns) == "table" then listeners = listeners + #conns end
+				end
+			end
+		end
+	end
+	local screen = halo:FindFirstAncestorOfClass("ScreenGui")
+	warn(string.format("[PU fish] halo is a %s | %d button(s) in it | %d listener(s) on it | fishing client input hooks %d | firesignal %s, getconnections %s | ScreenGui IgnoreGuiInset %s",
+		table.concat(parts, ""), buttons, listeners,
+		#Fn.fishingInputConnections("InputBegan"),
+		tostring(typeof(firesignal) == "function"), tostring(typeof(getconnections) == "function"),
+		tostring(screen and screen.IgnoreGuiInset)))
+end
+
+-- Sends one press of the given kind ("touch" or "mouse") at a window position, as it is
+-- handed to the virtual input manager. True if it could be sent.
+function Fn.sendRawPress(kind, x, y)
 	local gotVim, vim = pcall(function() return game:GetService("VirtualInputManager") end)
 	if not (gotVim and vim) then return false end
-
-	local kind, mode = string.match(variant, "^(%a+)/(%a+)$")
-	local shift = Fn.guiOffset(mode or "raw", halo)
-	x, y = x + shift.X, y + shift.Y
-
-	-- Pressed and released on consecutive frames, no added delay.
 	if kind == "touch" then
 		return (pcall(function()
 			vim:SendTouchEvent(1, 0, x, y)
@@ -3401,6 +3512,91 @@ function Fn.pressHalo(variant, halo, x, y)
 		RunService.Heartbeat:Wait()
 		vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
 	end))
+end
+
+-- Where a press actually lands. Phones can scale or shift what the virtual input manager is
+-- given, which showed up as presses landing well left of the halo. So the script measures it:
+-- a see-through button covering the whole window is pressed at two known spots and reports
+-- where each press arrived, which gives the scale and shift for each axis. Presses are then
+-- sent to the position that lands where wanted. Returns nil when nothing could be measured
+-- (presses are then sent as they are).
+function Fn.calibrate(kind)
+	local view = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize
+	local key = kind .. (view and (math.floor(view.X) .. "x" .. math.floor(view.Y)) or "")
+	local cached = Fish.cal[key]
+	if cached ~= nil then return cached or nil end
+
+	local probe = Instance.new("ScreenGui")
+	probe.Name = "NisulProbe"
+	probe.IgnoreGuiInset = true -- so its positions are plain window positions
+	probe.ResetOnSpawn = false
+	probe.DisplayOrder = 2147483647
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.fromScale(1, 1)
+	button.BackgroundTransparency = 1
+	button.Text = ""
+	button.AutoButtonColor = false
+	button.Active = true
+	button.Parent = probe
+	local parentOk = pcall(function()
+		probe.Parent = (typeof(gethui) == "function" and gethui()) or LocalPlayer:WaitForChild("PlayerGui")
+	end)
+
+	local result = false
+	if parentOk then
+		local landed
+		button.InputBegan:Connect(function(input)
+			if landed == nil and (input.UserInputType == Enum.UserInputType.Touch
+				or input.UserInputType == Enum.UserInputType.MouseButton1) then
+				landed = input.Position
+			end
+		end)
+		task.wait(0.1) -- let the button get its size
+
+		local size = button.AbsoluteSize
+		local function press(px, py)
+			landed = nil
+			Fn.sendRawPress(kind, px, py)
+			local limit = os.clock() + 0.5
+			while landed == nil and os.clock() < limit do RunService.Heartbeat:Wait() end
+			return landed
+		end
+
+		local p1x, p1y, p2x, p2y = size.X * 0.25, size.Y * 0.3, size.X * 0.75, size.Y * 0.7
+		local a = press(p1x, p1y)
+		local b = a and press(p2x, p2y)
+		if a and b and math.abs(b.X - a.X) > 20 and math.abs(b.Y - a.Y) > 20 then
+			local sx, sy = (b.X - a.X) / (p2x - p1x), (b.Y - a.Y) / (p2y - p1y)
+			result = { sx = sx, sy = sy, ox = a.X - sx * p1x, oy = a.Y - sy * p1y }
+			warn(string.format("[PU fish] %s presses land at x*%.3f%+.0f, y*%.3f%+.0f (window %dx%d)",
+				kind, sx, result.ox, sy, result.oy, size.X, size.Y))
+		else
+			warn("[PU fish] could not measure where " .. kind .. " presses land; sending them as they are")
+		end
+	end
+	pcall(function() probe:Destroy() end)
+
+	Fish.cal[key] = result
+	return result or nil
+end
+
+-- One press by the named way. True if it could be sent at all.
+function Fn.pressHalo(variant, halo, x, y)
+	if variant == "events" then return Fn.fireHaloEvents(halo, x, y) end
+
+	local kind, mode = string.match(variant, "^(%a+)/(%a+)$")
+	kind = kind or "mouse"
+
+	-- The halo's position, as a window position...
+	local shift = Fn.guiOffset(mode or "raw", halo)
+	x, y = x + shift.X, y + shift.Y
+
+	-- ...then what has to be handed to the input system for it to land there.
+	local cal = Fn.calibrate(kind)
+	if cal then x, y = (x - cal.ox) / cal.sx, (y - cal.oy) / cal.sy end
+
+	-- Pressed and released on consecutive frames, no added delay.
+	return Fn.sendRawPress(kind, x, y)
 end
 
 -- How the game scores a tap, readable on our own player: the streak luck goes up with
@@ -3430,6 +3626,7 @@ function Fn.tapOnce()
 		return
 	end
 	Fish.haloText = "halo showing"
+	Fn.describeHalo(halo)
 
 	local variants = Fn.tapVariants()
 	if Fish.variantName then
